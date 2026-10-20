@@ -27,10 +27,21 @@
 # provide either a read-only GitHub token or a read-only SSH deploy key at
 # install time, and it is stored under /etc/jeevo with tight permissions.
 #
+# Piped-install safety:
+#   * All interactive prompts read from /dev/tty, never from stdin, so
+#     `curl ... | sudo bash` works (stdin is the script itself there).
+#   * The whole script body lives in main(), invoked on the LAST line, so
+#     bash has parsed the complete script before executing anything and no
+#     child process can swallow part of it from the pipe.
+#
 # Environment overrides (used by the automated tests; not for production):
 #     JEEVO_SYSTEMD=0          skip systemd/nginx integration (test containers)
 #     JEEVO_ASSUME_YES=1       answer every prompt with its default
 #     JEEVO_SKIP_PYTHON_CHECK=1  allow Python older than 3.9 (test containers)
+#
+# Unattended piped install (sudo strips the environment, so pass it via env):
+#     curl -fsSL <url>/install.sh | sudo env JEEVO_ASSUME_YES=1 \
+#         GITHUB_TOKEN=... AUTH_PASSWORD=... bash
 #
 set -euo pipefail
 
@@ -52,6 +63,7 @@ die()  { printf '  \033[0;31mxx\033[0m  %s\n' "$*" >&2; exit 1; }
 # prompt VAR "Question" "default" — default wins on empty input (and always,
 # in JEEVO_ASSUME_YES mode). A variable already set in the environment wins
 # over everything (used by the automated tests and for scripted installs).
+# Input is read from /dev/tty so that piped installs (curl | bash) work.
 prompt() {
   local var="$1" q="$2" def="$3" reply
   if [[ -n "${!var:-}" ]]; then
@@ -63,7 +75,7 @@ prompt() {
     printf '  %s [%s] %s\n' "$q" "$def" "$def"
     return
   fi
-  read -r -p "  $q [$def]: " reply || true
+  read -r -p "  $q [$def]: " reply </dev/tty || true
   printf -v "$var" '%s' "${reply:-$def}"
 }
 
@@ -80,7 +92,7 @@ prompt_secret() {
     return
   fi
   while true; do
-    read -r -s -p "  $q: " reply
+    read -r -s -p "  $q: " reply </dev/tty
     printf '\n'
     reply="${reply:-$def}"
     if [[ -n "$reply" ]]; then printf -v "$var" '%s' "$reply"; return; fi
@@ -98,11 +110,18 @@ require_abs_path() {
 GIT_ENV=()
 as_jeevo() { runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" "${GIT_ENV[@]}" "$@"; }
 
+main() {
+
 # ---------------------------------------------------------------- 0. guards
 
 info "Checking the system"
 
 [[ $EUID -eq 0 ]] || die "Run this installer as root: curl -fsSL <url>/install.sh | sudo bash"
+
+# Prompts need a real terminal (stdin is the script when piped from curl).
+if [[ "$ASSUME_YES" != 1 ]] && ! { : </dev/tty; } 2>/dev/null; then
+  die "No terminal available for prompts. Re-run from an interactive terminal, or set JEEVO_ASSUME_YES=1 and preset the variables (AUTH_PASSWORD, GITHUB_TOKEN, ...) in the environment."
+fi
 
 [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release; only Debian/Ubuntu are supported."
 # shellcheck disable=SC1091
@@ -287,8 +306,8 @@ else
   UPDATE_MODE=ref
   prompt REF "No v* release tags found. Which ref should 'jeevo update' track?" "master"
   if [[ "$ASSUME_YES" != 1 ]]; then
-    read -r -p "  '${REF}' is a development branch, not a release. Track it anyway? [y/N]: " REPLY
-    [[ "$REPLY" == y || "$REPLY" == Y ]] || die "Aborted. Create versioned tags (v1.2.3) on the repository, or re-run and accept tracking ${REF}."
+    read -r -p "  '${REF}' is a development branch, not a release. Track it anyway? [y/N]: " REPLY </dev/tty || true
+    [[ "${REPLY:-}" == y || "${REPLY:-}" == Y ]] || die "Aborted. Create versioned tags (v1.2.3) on the repository, or re-run and accept tracking ${REF}."
   fi
   warn "Updates will track '${REF}'. Once v* release tags exist on the repository,"
   warn "'jeevo update' switches to the latest tag automatically."
@@ -831,3 +850,9 @@ Jeevo is installed.
   TLS is not configured. Before exposing Jeevo beyond your LAN, put a
   certificate in front of nginx (e.g. certbot) and see INSTALL.md.
 EOF
+
+}
+
+# Everything above is only DEFINITIONS; nothing has executed yet. Because this
+# is the last line, bash has read the entire script before running main().
+main "$@"
