@@ -161,6 +161,25 @@ run() {
   FAIL_HINT=""
 }
 
+# read_masked VAR — read from the terminal, echoing one * per character.
+# Handles paste and backspace; Enter finishes.
+read_masked() {
+  local __var="$1" __ch __buf=""
+  while IFS= read -r -s -n1 __ch </dev/tty; do
+    if [[ -z "$__ch" ]]; then break; fi
+    if [[ "$__ch" == $'\x7f' || "$__ch" == $'\b' ]]; then
+      if [[ -n "$__buf" ]]; then __buf="${__buf%?}"; printf '\b \b'; fi
+    elif [[ "$__ch" == $'\x1b' ]]; then
+      continue
+    else
+      __buf+="$__ch"
+      printf '*'
+    fi
+  done
+  printf '\n'
+  printf -v "$__var" '%s' "$__buf"
+}
+
 # prompt VAR "Question" "default" ["help text"] — default wins on empty input
 # (and always, in JEEVO_ASSUME_YES mode). A variable already set in the
 # environment wins over everything (automated tests and scripted installs).
@@ -196,9 +215,14 @@ prompt_secret() {
   fi
   if [[ -n "$help" ]]; then note "$help"; fi
   while true; do
-    read -r -s -p "  ${CYAN}${S_Q}${RESET} ${q} ${S_ARROW} " reply </dev/tty || true
-    printf '\n'
-    reply="${reply:-$def}"
+    printf '  %s%s%s %s %s ' "$CYAN" "$S_Q" "$RESET" "$q" "$S_ARROW"
+    read_masked reply
+    if [[ -z "$reply" && -n "$def" ]]; then
+      reply="$def"
+      printf '  %s(using the generated value)%s\n' "$DIM" "$RESET"
+    elif [[ -n "$reply" ]]; then
+      printf '  %sreceived %d characters%s\n' "$DIM" "${#reply}" "$RESET"
+    fi
     if [[ -n "$reply" ]]; then printf -v "$var" '%s' "$reply"; return; fi
     printf '  %s(cannot be empty)%s\n' "$DIM" "$RESET"
   done
