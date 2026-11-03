@@ -2,7 +2,7 @@
 #
 # Jeevo — Linux installer.
 #
-# Installs Jeevo (Node backend API + web bundle + Python AI worker) as
+# Installs Jeevo (pnpm monorepo: Node API + web bundle + Python AI worker) as
 # production systemd services behind nginx, and installs the `jeevo` admin
 # CLI (`sudo jeevo update`, `status`, `logs`, `restart`, `version`).
 #
@@ -13,12 +13,17 @@
 #
 # Layout it creates:
 #     /opt/jeevo            application code (git clone; replaceable)
+#                             apps/api  apps/web  apps/ai-worker  packages/shared
 #     /etc/jeevo            configuration, secrets, install metadata
 #     /var/lib/jeevo        database (host storage) + service user home
 #     <data dir>            LARGE FILES: media-store/ and artwork/
 #                           (point this at your network storage if you like)
 #     /usr/local/bin/jeevo  admin CLI
 #     systemd units: jeevo-api, jeevo-worker; nginx site "jeevo"
+#
+# This installer targets the pnpm monorepo layout and FRESH installs only.
+# Installations made by the old installer (backend/ + frontend/ + npm) are not
+# migrated.
 #
 # It never overwrites an existing installation: if /etc/jeevo/install.conf
 # exists the script exits and tells you to use `sudo jeevo update` instead.
@@ -28,8 +33,14 @@
 # install time, and it is stored under /etc/jeevo with tight permissions.
 #
 # What you see: a numbered step list with a spinner for slow tasks. All
-# command output (apt, npm, pip, build...) goes to /var/log/jeevo-install.log
+# command output (apt, pnpm, pip, build...) goes to /var/log/jeevo-install.log
 # and is shown only if something fails.
+#
+# Push notifications: the installer generates a VAPID key pair ONCE and stores
+# it in /etc/jeevo/backend.env. Never regenerate it on an existing install:
+# a new pair invalidates every device's push subscription. Push also needs a
+# contact email (VAPID_SUBJECT); if you skip it, push stays off until you add
+# it to backend.env and restart the API.
 #
 # Piped-install safety:
 #   * All interactive prompts read from /dev/tty, never from stdin, so
@@ -46,7 +57,7 @@
 #
 # Unattended piped install (sudo strips the environment, so pass it via env):
 #     curl -fsSL <url>/install.sh | sudo env JEEVO_ASSUME_YES=1 \
-#         GITHUB_TOKEN=... AUTH_PASSWORD=... bash
+#         GITHUB_TOKEN=... AUTH_PASSWORD=... VAPID_EMAIL=you@example.org bash
 #
 set -Eeuo pipefail
 
@@ -57,6 +68,10 @@ SERVICE_USER=jeevo
 SERVICE_HOME=/var/lib/jeevo
 LOG=/var/log/jeevo-install.log
 
+# Node major installed when the system has none (or an older one). The repo pins
+# a very recent pnpm, which follows current Node LTS releases.
+NODE_MAJOR=22
+
 SYSTEMD="${JEEVO_SYSTEMD:-1}"
 ASSUME_YES="${JEEVO_ASSUME_YES:-0}"
 UPLOAD_MAX_MB=2048
@@ -66,6 +81,7 @@ STEP=0
 FAIL_HINT=""
 PW_GENERATED=0
 PW_SHOWN=""
+PUSH_ENABLED=0
 
 # ------------------------------------------------------------ terminal UI
 
@@ -243,18 +259,48 @@ on_interrupt() {
 
 # ----------------------------------------------------------------- helpers
 
-# All git operations run as the service user, with the configured auth
+# All git/pnpm/pip operations run as the service user, with the configured auth
 # environment. Filled in during the authentication phase.
 GIT_ENV=()
 as_jeevo() { runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" "${GIT_ENV[@]}" "$@"; }
+
+# as_jeevo_in DIR command... — like as_jeevo, but inside DIR. Needed for
+# anything that resolves modules relative to the working directory.
+as_jeevo_in() {
+  local dir="$1"
+  shift
+  runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" "${GIT_ENV[@]}" \
+    bash -c 'cd "$1" && shift && exec "$@"' _ "$dir" "$@"
+}
 
 # Read-only git queries as root: the repo is owned by the service user, so git
 # must be told to trust it ("dubious ownership").
 gitv() { git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" "$@"; }
 
 install_node() {
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
   apt-get install -y -qq nodejs
+}
+
+# The pnpm version the repository pins in its root package.json
+# ("packageManager": "pnpm@X.Y.Z[+sha...]"). Prints X.Y.Z; fails if not pnpm.
+pinned_pnpm() {
+  local pm v
+  pm="$(node -p "require('${INSTALL_DIR}/package.json').packageManager || ''" 2>/dev/null || true)"
+  [[ "$pm" == pnpm@* ]] || return 1
+  v="${pm#pnpm@}"
+  v="${v%%+*}"
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || return 1
+  printf '%s' "$v"
+}
+
+# Install exactly the pinned pnpm globally (as root), unless it already matches.
+ensure_pnpm() {
+  local want have
+  want="$(pinned_pnpm)" || return 1
+  have="$(pnpm --version 2>/dev/null || true)"
+  [[ "$have" == "$want" ]] && return 0
+  npm install -g "pnpm@${want}"
 }
 
 reload_nginx() { systemctl reload nginx || systemctl restart nginx; }
@@ -273,6 +319,7 @@ health_check() {
 main() {
 
 umask 022
+cd /
 trap 'on_err "$?" "$LINENO"' ERR
 trap on_interrupt INT TERM
 trap show_cursor EXIT
@@ -292,7 +339,7 @@ note "Details are written to ${LOG}"
 
 # Prompts need a real terminal (stdin is the script when piped from curl).
 if [[ "$ASSUME_YES" != 1 ]] && ! { : </dev/tty; } 2>/dev/null; then
-  die "No terminal available for prompts. Re-run from an interactive terminal, or set JEEVO_ASSUME_YES=1 and preset the variables (AUTH_PASSWORD, GITHUB_TOKEN, ...) in the environment."
+  die "No terminal available for prompts. Re-run from an interactive terminal, or set JEEVO_ASSUME_YES=1 and preset the variables (AUTH_PASSWORD, GITHUB_TOKEN, VAPID_EMAIL, ...) in the environment."
 fi
 
 [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release; only Debian/Ubuntu are supported."
@@ -382,6 +429,25 @@ if [[ "$AUTH_PASSWORD" == "$AUTH_PASSWORD_DEFAULT" ]]; then
   PW_SHOWN="$AUTH_PASSWORD"
 fi
 
+section "Push notifications (optional)"
+while true; do
+  prompt VAPID_EMAIL "Contact email (Enter to skip)" "" \
+    "Push services require a contact address. It is only sent to the browser push servers (Apple, Google, Mozilla), never shown to users. Skip it and Jeevo works normally, but no push notifications are sent to phones."
+  VAPID_EMAIL="${VAPID_EMAIL#mailto:}"
+  VAPID_EMAIL="${VAPID_EMAIL//[[:space:]]/}"
+  if [[ -z "$VAPID_EMAIL" || "$VAPID_EMAIL" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then break; fi
+  warn "'${VAPID_EMAIL}' does not look like an email address."
+  [[ "$ASSUME_YES" != 1 ]] || die "VAPID_EMAIL is not a valid email address."
+  VAPID_EMAIL=""
+done
+if [[ -n "$VAPID_EMAIL" ]]; then
+  case "${VAPID_EMAIL##*@}" in
+    example.com|example.org|example.net|localhost|*.local|*.test)
+      warn "Apple rejects placeholder-looking contact domains. Use a real address."
+      ;;
+  esac
+fi
+
 section "Review"
 kv "Code"         "$INSTALL_DIR"
 kv "Media"        "$DATA_DIR"
@@ -390,6 +456,7 @@ kv "API port"     "$PORT (internal)"
 kv "Max upload"   "${UPLOAD_MAX_MB} MB"
 kv "Repository"   "$REPO_URL"
 kv "Owner"        "$AUTH_USERNAME"
+kv "Push email"   "${VAPID_EMAIL:-none (push notifications off)}"
 printf '\n'
 if ! confirm "Install with these settings?" y; then
   printf '\n  Cancelled. Nothing was changed.\n\n'
@@ -401,16 +468,19 @@ fi
 step "System packages"
 export DEBIAN_FRONTEND=noninteractive
 run "Updating package lists" apt-get update -qq
-run "Installing git, nginx, ffmpeg and Python" \
+# build-essential is a fallback for native modules (better-sqlite3) when no
+# prebuilt binary matches this machine.
+run "Installing git, nginx, ffmpeg, Python and build tools" \
   apt-get install -y -qq git curl ca-certificates openssl python3 python3-venv \
-  python3-pip nginx ffmpeg util-linux
+  python3-pip nginx ffmpeg util-linux build-essential
 
 if ! command -v node >/dev/null 2>&1 \
-  || [[ "$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" -lt 20 ]]; then
-  run "Installing Node.js 20" install_node
+  || [[ "$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" -lt "$NODE_MAJOR" ]]; then
+  run "Installing Node.js ${NODE_MAJOR}" install_node
 fi
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-[[ "$NODE_MAJOR" -ge 20 ]] || die "Node.js 20+ is required; found $(node --version)."
+NODE_FOUND="$(node -p 'process.versions.node.split(".")[0]')"
+[[ "$NODE_FOUND" -ge "$NODE_MAJOR" ]] || die "Node.js ${NODE_MAJOR}+ is required; found $(node --version)."
+NODE_BIN="$(command -v node)"
 ok "Node.js $(node --version), npm $(npm --version)"
 
 PY_VER="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
@@ -440,7 +510,7 @@ install -d -m 755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SERVICE_HOME"
 install -d -m 755 -o "$SERVICE_USER" -g "$SERVICE_USER" \
   "$DATA_DIR" "$DATA_DIR/media-store" "$DATA_DIR/artwork"
 ok "${CONF_DIR} ${DIM}(configuration, root-owned)${RESET}"
-ok "${SERVICE_HOME} ${DIM}(database)${RESET}"
+ok "${SERVICE_HOME} ${DIM}(database, pnpm store)${RESET}"
 ok "${DATA_DIR} ${DIM}(media-store + artwork)${RESET}"
 if ! mountpoint -q "$DATA_DIR"; then
   warn "${DATA_DIR} is not a mount point. Fine for a local disk. If this is"
@@ -519,15 +589,36 @@ install -d -m 755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$INSTALL_DIR"
 run "Cloning the repository" as_jeevo git clone --quiet "$REPO_URL" "$INSTALL_DIR"
 ok "Version $(gitv describe --tags --always)"
 
+# This installer only understands the pnpm monorepo layout. Fail early and
+# clearly on anything else (for example an old backend/ + frontend/ checkout).
+if [[ ! -f "$INSTALL_DIR/pnpm-workspace.yaml" || ! -d "$INSTALL_DIR/apps/api" \
+   || ! -d "$INSTALL_DIR/apps/web" || ! -d "$INSTALL_DIR/apps/ai-worker" ]]; then
+  die "This repository does not have the expected layout (pnpm-workspace.yaml, apps/api, apps/web, apps/ai-worker). This installer targets the pnpm monorepo and fresh installs only."
+fi
+
 # -------------------------------------------------------- 6. dependencies
 
 step "Installing dependencies"
-run "Backend packages (npm)"  as_jeevo npm --prefix "$INSTALL_DIR/backend" ci --no-audit --no-fund
-run "Frontend packages (npm)" as_jeevo npm --prefix "$INSTALL_DIR/frontend" ci --no-audit --no-fund
-run "Creating the Python environment" as_jeevo python3 -m venv "$INSTALL_DIR/ai-worker/.venv"
-run "Updating pip" as_jeevo "$INSTALL_DIR/ai-worker/.venv/bin/python" -m pip install --quiet --upgrade pip
-run "AI worker packages (pip)" as_jeevo "$INSTALL_DIR/ai-worker/.venv/bin/python" -m pip install --quiet \
-  -r "$INSTALL_DIR/ai-worker/requirements.txt"
+
+PNPM_WANT="$(pinned_pnpm)" \
+  || die "The repository's package.json must pin pnpm in its \"packageManager\" field (found none)."
+run "Installing pnpm ${PNPM_WANT}" ensure_pnpm
+
+FAIL_HINT="pnpm install failed. If the log mentions ignored build scripts, check pnpm.onlyBuiltDependencies / allowBuilds for better-sqlite3, esbuild and ffmpeg-static."
+run "Installing packages (pnpm)" as_jeevo pnpm --dir "$INSTALL_DIR" install --frozen-lockfile
+FAIL_HINT="better-sqlite3 has no usable native build. Check the pnpm install section of the log for build errors."
+run "Checking native modules" as_jeevo_in "$INSTALL_DIR/apps/api" \
+  node -e 'new (require("better-sqlite3"))(":memory:").close()'
+
+# The worker keeps its model cache inside the app directory; create it up front
+# because the API unit lists it as a writable path (systemd refuses to start a
+# unit whose ReadWritePaths entry does not exist).
+install -d -m 755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$INSTALL_DIR/apps/ai-worker/models"
+
+run "Creating the Python environment" as_jeevo python3 -m venv "$INSTALL_DIR/apps/ai-worker/.venv"
+run "Updating pip" as_jeevo "$INSTALL_DIR/apps/ai-worker/.venv/bin/python" -m pip install --quiet --upgrade pip
+run "AI worker packages (pip)" as_jeevo "$INSTALL_DIR/apps/ai-worker/.venv/bin/python" -m pip install --quiet \
+  -r "$INSTALL_DIR/apps/ai-worker/requirements.txt"
 
 # ------------------------------------------------------ 7. configure + build
 
@@ -536,6 +627,25 @@ step "Configuring and building"
 WORKER_TOKEN="$(openssl rand -hex 32)"
 [[ -n "$WORKER_TOKEN" ]] || die "Could not generate WORKER_TOKEN (openssl failed)."
 
+# Push (VAPID) keys: generated exactly once, here. The public key is handed to
+# browsers; the private key signs every push. Regenerating either later would
+# silently break every device's subscription, so neither `jeevo update` nor any
+# other command ever touches them.
+VAPID_PAIR="$(as_jeevo_in "$INSTALL_DIR/apps/api" node -e \
+  'const w=require("web-push");const k=w.generateVAPIDKeys();process.stdout.write(k.publicKey+" "+k.privateKey)' \
+  2>>"$LOG")" || die "Could not generate the push notification keys (web-push is part of apps/api)."
+VAPID_PUBLIC_KEY="${VAPID_PAIR%% *}"
+VAPID_PRIVATE_KEY="${VAPID_PAIR##* }"
+[[ -n "$VAPID_PUBLIC_KEY" && -n "$VAPID_PRIVATE_KEY" && "$VAPID_PUBLIC_KEY" != "$VAPID_PRIVATE_KEY" ]] \
+  || die "Push key generation returned unexpected output."
+if [[ -n "$VAPID_EMAIL" ]]; then
+  VAPID_SUBJECT="mailto:${VAPID_EMAIL}"
+  PUSH_ENABLED=1
+else
+  VAPID_SUBJECT=""
+  PUSH_ENABLED=0
+fi
+
 BACKEND_ENV="${CONF_DIR}/backend.env"
 WORKER_ENV="${CONF_DIR}/worker.env"
 install -m 640 -o root -g "$SERVICE_USER" /dev/null "$BACKEND_ENV"
@@ -543,7 +653,7 @@ install -m 640 -o root -g "$SERVICE_USER" /dev/null "$WORKER_ENV"
 
 cat > "$BACKEND_ENV" <<EOF
 # Jeevo backend configuration. Written by install.sh — edit deliberately.
-# Loaded through the symlink at ${INSTALL_DIR}/backend/.env.
+# Loaded through the symlink at ${INSTALL_DIR}/apps/api/.env.
 # The owner account below is only used the FIRST time the database is created;
 # afterwards the database is authoritative (change it in the app UI).
 NODE_ENV=production
@@ -560,29 +670,36 @@ UPLOAD_MAX_MB=${UPLOAD_MAX_MB}
 WORKER_TOKEN=${WORKER_TOKEN}
 PROCESSING_ENABLED=true
 NSFW_SYNC_SCAN=true
-JEEVO_PYTHON=${INSTALL_DIR}/ai-worker/.venv/bin/python
-JEEVO_AI_WORKER_DIR=${INSTALL_DIR}/ai-worker
-JEEVO_MODEL_CACHE=${INSTALL_DIR}/ai-worker/models
+JEEVO_PYTHON=${INSTALL_DIR}/apps/ai-worker/.venv/bin/python
+JEEVO_AI_WORKER_DIR=${INSTALL_DIR}/apps/ai-worker
+JEEVO_MODEL_CACHE=${INSTALL_DIR}/apps/ai-worker/models
 JEEVO_DEVICE=auto
 NSFW_THRESHOLD=0.8
+
+# Push notifications. NEVER regenerate this key pair on a running install:
+# every device would have to turn notifications on again. Push stays off until
+# VAPID_SUBJECT is a real mailto: address or https URL (then: jeevo restart api).
+VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY}
+VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY}
+VAPID_SUBJECT=${VAPID_SUBJECT}
 EOF
 
 cat > "$WORKER_ENV" <<EOF
 # Jeevo AI worker configuration. Written by install.sh — edit deliberately.
-# Loaded through the symlink at ${INSTALL_DIR}/ai-worker/.env.
+# Loaded through the symlink at ${INSTALL_DIR}/apps/ai-worker/.env.
 JEEVO_BACKEND_URL=http://127.0.0.1:${PORT}
 JEEVO_WORKER_TOKEN=${WORKER_TOKEN}
-JEEVO_MODEL_CACHE=${INSTALL_DIR}/ai-worker/models
+JEEVO_MODEL_CACHE=${INSTALL_DIR}/apps/ai-worker/models
 JEEVO_DEVICE=auto
 JEEVO_LOG_LEVEL=info
 EOF
-unset AUTH_PASSWORD WORKER_TOKEN
+unset AUTH_PASSWORD WORKER_TOKEN VAPID_PRIVATE_KEY VAPID_PAIR
 
 # The backend has no PATH fallback for ffmpeg: when the npm static build is
 # missing (offline install, --omit=optional, an arch without a prebuild), the
 # distro package installed above is used instead.
-if [[ ! -x "$INSTALL_DIR/backend/node_modules/ffmpeg-static/ffmpeg" ]] \
-  || [[ ! -e "$INSTALL_DIR/backend/node_modules/ffprobe-static" ]]; then
+if [[ ! -x "$INSTALL_DIR/apps/api/node_modules/ffmpeg-static/ffmpeg" ]] \
+  || [[ ! -e "$INSTALL_DIR/apps/api/node_modules/ffprobe-static" ]]; then
   {
     echo "FFMPEG_PATH=/usr/bin/ffmpeg"
     echo "FFPROBE_PATH=/usr/bin/ffprobe"
@@ -592,12 +709,24 @@ fi
 
 # The apps keep loading their own .env files; symlinks point them at the
 # protected copies in /etc/jeevo so updates never touch configuration.
-ln -sfn "$BACKEND_ENV" "$INSTALL_DIR/backend/.env"
-ln -sfn "$WORKER_ENV"  "$INSTALL_DIR/ai-worker/.env"
+ln -sfn "$BACKEND_ENV" "$INSTALL_DIR/apps/api/.env"
+ln -sfn "$WORKER_ENV"  "$INSTALL_DIR/apps/ai-worker/.env"
 ok "Settings and secrets written to ${CONF_DIR}"
+if [[ "$PUSH_ENABLED" == 1 ]]; then
+  ok "Push notification keys generated ${DIM}(contact: ${VAPID_EMAIL})${RESET}"
+else
+  ok "Push notification keys generated ${DIM}(push is OFF until a contact email is set)${RESET}"
+fi
 
-run "Building the backend"  as_jeevo npm --prefix "$INSTALL_DIR/backend" run build
-run "Building the web app"  as_jeevo env VITE_API_URL= npm --prefix "$INSTALL_DIR/frontend" run build
+# `pnpm -r run build` builds in dependency order (packages/shared first, then
+# the API and the web app).
+FAIL_HINT="The build failed. The web build also type-checks, so a TypeScript error in the repository stops the install. Fix it upstream or install a different version."
+run "Building Jeevo (API and web app)" \
+  as_jeevo env VITE_API_URL= pnpm --dir "$INSTALL_DIR" -r --if-present run build
+[[ -f "$INSTALL_DIR/apps/api/dist/main.js" ]] \
+  || die "The build finished but apps/api/dist/main.js is missing."
+[[ -f "$INSTALL_DIR/apps/web/dist/index.html" ]] \
+  || die "The build finished but apps/web/dist/index.html is missing."
 
 # ---------------------------------------------------------- 8. services
 
@@ -613,9 +742,9 @@ After=network.target
 Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
-WorkingDirectory=${INSTALL_DIR}/backend
+WorkingDirectory=${INSTALL_DIR}/apps/api
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/node dist/main.js
+ExecStart=${NODE_BIN} dist/main.js
 Restart=on-failure
 RestartSec=5
 
@@ -624,7 +753,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${DATA_DIR} ${SERVICE_HOME} ${INSTALL_DIR}/ai-worker/models
+ReadWritePaths=${DATA_DIR} ${SERVICE_HOME} ${INSTALL_DIR}/apps/ai-worker/models
 
 [Install]
 WantedBy=multi-user.target
@@ -639,8 +768,8 @@ After=network.target jeevo-api.service
 Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
-WorkingDirectory=${INSTALL_DIR}/ai-worker
-ExecStart=${INSTALL_DIR}/ai-worker/.venv/bin/python -m src.main
+WorkingDirectory=${INSTALL_DIR}/apps/ai-worker
+ExecStart=${INSTALL_DIR}/apps/ai-worker/.venv/bin/python -m src.main
 Restart=always
 RestartSec=5
 
@@ -651,7 +780,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${INSTALL_DIR}/ai-worker/models
+ReadWritePaths=${INSTALL_DIR}/apps/ai-worker/models
 
 [Install]
 WantedBy=multi-user.target
@@ -665,7 +794,7 @@ server {
     listen 80 default_server;
     server_name ${SITE_HOST};
 
-    root ${INSTALL_DIR}/frontend/dist;
+    root ${INSTALL_DIR}/apps/web/dist;
     index index.html;
 
     # Uploads are multipart up to UPLOAD_MAX_MB; leave matching headroom.
@@ -693,13 +822,19 @@ server {
         proxy_set_header If-Range \$http_if_range;
     }
 
-    # Hashed assets are immutable; index.html and the service worker never are.
+    # Hashed assets are immutable; index.html, the service worker and the
+    # manifest never are (a stale service worker would pin users to an old build).
     location /assets/ {
         expires 1y;
         add_header Cache-Control "public, immutable";
     }
-    location = /sw.js      { add_header Cache-Control "no-cache, must-revalidate"; }
-    location = /index.html { add_header Cache-Control "no-cache, must-revalidate"; }
+    location = /sw.js         { add_header Cache-Control "no-cache, must-revalidate"; }
+    location = /registerSW.js { add_header Cache-Control "no-cache, must-revalidate"; }
+    location = /manifest.webmanifest {
+        default_type application/manifest+json;
+        add_header Cache-Control "no-cache, must-revalidate";
+    }
+    location = /index.html    { add_header Cache-Control "no-cache, must-revalidate"; }
     location / { try_files \$uri \$uri/ /index.html; }
 }
 EOF
@@ -721,14 +856,16 @@ EOF
 else
   warn "JEEVO_SYSTEMD=0: skipping systemd units and nginx (test/container mode)."
   # Test mode: boot the freshly built API directly, probe it, then stop it.
-  runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" NODE_ENV=production \
-    node dist/main.js >/tmp/jeevo-health.log 2>&1 &
+  as_jeevo_in "$INSTALL_DIR/apps/api" env NODE_ENV=production \
+    "$NODE_BIN" dist/main.js >/tmp/jeevo-health.log 2>&1 &
   API_PID=$!
   if ! _run "Waiting for the API to respond (manual probe)" health_check; then
     cat /tmp/jeevo-health.log >&2 || true
+    pkill -u "$SERVICE_USER" -f 'dist/main.js' 2>/dev/null || true
     kill "$API_PID" 2>/dev/null || true
     die "The API did not answer its health check."
   fi
+  pkill -u "$SERVICE_USER" -f 'dist/main.js' 2>/dev/null || true
   kill "$API_PID" 2>/dev/null || true
   wait "$API_PID" 2>/dev/null || true
 fi
@@ -862,7 +999,7 @@ require_systemd() { [[ "$SYSTEMD" == 1 ]] || die "this installation has systemd 
 # Read-only git queries as root (the repo belongs to the service user).
 cgit() { git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" "$@"; }
 
-# All git/npm/pip operations run as the service user with the stored auth.
+# All git/pnpm/pip operations run as the service user with the stored auth.
 git_env() {
   local -a envs=("HOME=${SERVICE_HOME:-/var/lib/jeevo}" "GIT_TERMINAL_PROMPT=0")
   case "$GIT_KIND" in
@@ -874,6 +1011,26 @@ git_env() {
       ;;
   esac
   runuser -u "$SERVICE_USER" -- env "${envs[@]}" "$@"
+}
+
+# The pnpm version the (newly checked-out) repository pins in package.json.
+pinned_pnpm() {
+  local pm v
+  pm="$(node -p "require('${INSTALL_DIR}/package.json').packageManager || ''" 2>/dev/null || true)"
+  [[ "$pm" == pnpm@* ]] || return 1
+  v="${pm#pnpm@}"
+  v="${v%%+*}"
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || return 1
+  printf '%s' "$v"
+}
+
+# A release can bump the pinned pnpm, so match it before installing packages.
+ensure_pnpm() {
+  local want have
+  want="$(pinned_pnpm)" || { echo "package.json does not pin pnpm in packageManager" >&2; return 1; }
+  have="$(pnpm --version 2>/dev/null || true)"
+  [[ "$have" == "$want" ]] && return 0
+  npm install -g "pnpm@${want}"
 }
 
 api_healthy() {
@@ -987,19 +1144,20 @@ do_update() {
   fi
 
   step "Checking out ${tgt_desc}" git_env git -C "$INSTALL_DIR" checkout -f --detach "$target"
-  step "Backend packages (npm)"  git_env npm --prefix "$INSTALL_DIR/backend" ci --no-audit --no-fund
-  step "Frontend packages (npm)" git_env npm --prefix "$INSTALL_DIR/frontend" ci --no-audit --no-fund
-  if [[ ! -x "$INSTALL_DIR/ai-worker/.venv/bin/python" ]]; then
-    step "Creating the Python environment" git_env python3 -m venv "$INSTALL_DIR/ai-worker/.venv"
+  step "Matching the pinned pnpm version" ensure_pnpm
+  step "Installing packages (pnpm)" git_env pnpm --dir "$INSTALL_DIR" install --frozen-lockfile
+  if [[ ! -x "$INSTALL_DIR/apps/ai-worker/.venv/bin/python" ]]; then
+    step "Creating the Python environment" git_env python3 -m venv "$INSTALL_DIR/apps/ai-worker/.venv"
   fi
-  step "Updating pip" git_env "$INSTALL_DIR/ai-worker/.venv/bin/python" -m pip install --quiet --upgrade pip
-  step "AI worker packages (pip)" git_env "$INSTALL_DIR/ai-worker/.venv/bin/python" -m pip install --quiet \
-    -r "$INSTALL_DIR/ai-worker/requirements.txt"
-  step "Building the backend" git_env npm --prefix "$INSTALL_DIR/backend" run build
-  step "Building the web app" git_env env VITE_API_URL= npm --prefix "$INSTALL_DIR/frontend" run build
+  step "Updating pip" git_env "$INSTALL_DIR/apps/ai-worker/.venv/bin/python" -m pip install --quiet --upgrade pip
+  step "AI worker packages (pip)" git_env "$INSTALL_DIR/apps/ai-worker/.venv/bin/python" -m pip install --quiet \
+    -r "$INSTALL_DIR/apps/ai-worker/requirements.txt"
+  step "Building Jeevo (API and web app)" \
+    git_env env VITE_API_URL= pnpm --dir "$INSTALL_DIR" -r --if-present run build
 
   # Database migrations are additive and run automatically the next time the
-  # API starts (backend/src/db/db.ts). Nothing here touches the database.
+  # API starts (apps/api/src/db/db.ts). Nothing here touches the database, the
+  # configuration, or the push (VAPID) keys in backend.env.
   sed -i "s/^VERSION=.*/VERSION=$(cgit rev-parse --short=12 HEAD)/" "$CONF"
   sed -i "s/^VERSION_DESC=.*/VERSION_DESC=$(cgit describe --tags --always 2>/dev/null || true)/" "$CONF"
 
@@ -1083,6 +1241,17 @@ else
 fi
 note "The password is only used on first start. Change it in Settings -> Administration -> Users."
 
+section "Push notifications"
+if [[ "$PUSH_ENABLED" == 1 ]]; then
+  kv "Status" "enabled ${DIM}(contact: ${VAPID_EMAIL})${RESET}"
+else
+  kv "Status" "${BOLD}off${RESET} ${DIM}(no contact email was given)${RESET}"
+  note "To turn it on, set VAPID_SUBJECT=mailto:you@yourdomain in ${BACKEND_ENV}"
+  note "then run: sudo jeevo restart api"
+fi
+note "The key pair was generated once and lives in backend.env. Never regenerate"
+note "it: every phone would have to turn notifications on again."
+
 section "Where things are"
 kv "Version"   "${VERSION_DESC} (${VERSION_SHA})"
 kv "Code"      "$INSTALL_DIR"
@@ -1098,8 +1267,11 @@ kv "Restart"   "sudo jeevo restart"
 kv "Update"    "sudo jeevo update"
 
 printf '\n'
-warn "TLS is not configured. Before exposing Jeevo beyond your LAN, put a"
-warn "certificate in front of nginx (e.g. certbot) and see INSTALL.md."
+warn "HTTPS is not configured. Push notifications and installing Jeevo as an"
+warn "app on phones only work over HTTPS, so put a certificate in front of nginx"
+warn "yourself (for example: certbot --nginx)."
+warn "After switching to https://, set CORS_ORIGIN to the new address in"
+warn "${BACKEND_ENV} and run: sudo jeevo restart api"
 printf '\n'
 
 }
