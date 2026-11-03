@@ -605,7 +605,7 @@ PNPM_WANT="$(pinned_pnpm)" \
 run "Installing pnpm ${PNPM_WANT}" ensure_pnpm
 
 FAIL_HINT="pnpm install failed. If the log mentions ignored build scripts, check pnpm.onlyBuiltDependencies / allowBuilds for better-sqlite3, esbuild and ffmpeg-static."
-run "Installing packages (pnpm)" as_jeevo pnpm --dir "$INSTALL_DIR" install --frozen-lockfile
+run "Installing packages (pnpm)" as_jeevo pnpm --dir "$INSTALL_DIR" install
 FAIL_HINT="better-sqlite3 has no usable native build. Check the pnpm install section of the log for build errors."
 run "Checking native modules" as_jeevo_in "$INSTALL_DIR/apps/api" \
   node -e 'new (require("better-sqlite3"))(":memory:").close()'
@@ -1145,7 +1145,7 @@ do_update() {
 
   step "Checking out ${tgt_desc}" git_env git -C "$INSTALL_DIR" checkout -f --detach "$target"
   step "Matching the pinned pnpm version" ensure_pnpm
-  step "Installing packages (pnpm)" git_env pnpm --dir "$INSTALL_DIR" install --frozen-lockfile
+  step "Installing packages (pnpm)" git_env pnpm --dir "$INSTALL_DIR" install
   if [[ ! -x "$INSTALL_DIR/apps/ai-worker/.venv/bin/python" ]]; then
     step "Creating the Python environment" git_env python3 -m venv "$INSTALL_DIR/apps/ai-worker/.venv"
   fi
